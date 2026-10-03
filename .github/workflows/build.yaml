@@ -85,6 +85,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # gh release create --generate-notes 要读提交历史来生成说明，但
+      # download-artifact 只搬产物、不会把仓库带下来，缺了这步 gh 会在空目录里
+      # 报 "not a git repository"。fetch-depth: 0 是为了拿到完整历史 —— 默认的
+      # 浅克隆只有最近一次提交，生成出来的说明会缺东西。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           # 产物名已经带了平台后缀，合并到一处不会互相覆盖
