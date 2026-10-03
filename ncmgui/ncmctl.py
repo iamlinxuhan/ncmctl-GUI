@@ -55,6 +55,17 @@ def _fallback_paths() -> tuple[Path, ...]:
     )
 
 
+def _is_executable(path: Path) -> bool:
+    """判断这是个能跑的程序。
+
+    Windows 没有执行位，``os.access(..., os.X_OK)`` 在那边只能去翻 ``PATHEXT``
+    环境变量来猜，从资源管理器或计划任务启动时未必拿得到，所以不拿它当准。
+    """
+    if _IS_WINDOWS:
+        return path.is_file()
+    return path.is_file() and os.access(path, os.X_OK)
+
+
 class NcmctlNotFound(RuntimeError):
     """找不到 ncmctl 可执行文件。"""
 
@@ -131,7 +142,7 @@ def find_binary(explicit: str = "") -> str | None:
         if found:
             return found
         candidate = Path(explicit).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if _is_executable(candidate):
             return str(candidate)
         return None
 
@@ -139,9 +150,8 @@ def find_binary(explicit: str = "") -> str | None:
     if found:
         return found
 
-    for pattern in FALLBACK_PATHS:
-        candidate = Path(pattern).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+    for candidate in _fallback_paths():
+        if _is_executable(candidate):
             return str(candidate)
     return None
 
@@ -651,12 +661,40 @@ def build_version(opts: GlobalOpts | None = None) -> list[str]:
 
 def _selftest() -> int:
     """对每个构建器断言参数数组，返回失败数量。"""
+    from unittest import mock
+
+    from . import ensure_utf8_stdout
+
+    ensure_utf8_stdout()
     g = GlobalOpts()
     failures: list[str] = []
 
-    def check(name: str, got: list[str], want: list[str]) -> None:
+    def check(name: str, got: object, want: object) -> None:
         if got != want:
             failures.append(f"{name}\n    期望 {want}\n    实际 {got}")
+
+    # find_binary 的回退分支必须能跑完。它只在 PATH 命不中时才去翻常见安装
+    # 目录，而开发机的 PATH 里通常就有 ncmctl —— 那条分支平时根本走不到，里
+    # 面就是把名字写错了，自检也照样报「全部通过」。所以这里把 PATH 临时清掉
+    # 逼它走一遍，而不是听凭运行环境决定测不测得到。
+    try:
+        with mock.patch.dict(os.environ, {"PATH": "/nonexistent-ncmgui-probe"}):
+            find_binary()
+    except Exception as exc:
+        failures.append(f"find_binary 回退分支抛异常：{exc!r}")
+
+    fallbacks = _fallback_paths()
+    check("回退候选非空", bool(fallbacks), True)
+    check(
+        "回退候选数与常见目录数对得上",
+        len(fallbacks),
+        len(_COMMON_DIRS) * len({BINARY_NAME, "ncmctl"}),
+    )
+    check(
+        "回退候选都指向 ncmctl",
+        sorted({p.name for p in fallbacks}),
+        sorted({BINARY_NAME, "ncmctl"}),
+    )
 
     check(
         "download 常规",

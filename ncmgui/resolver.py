@@ -679,6 +679,9 @@ def _last_line(proc: subprocess.CompletedProcess) -> str:
 
 def _selftest() -> int:
     """不需要网络，只验证命名规则、目标解析与查重逻辑。"""
+    from . import ensure_utf8_stdout
+
+    ensure_utf8_stdout()
     failures: list[str] = []
 
     def check(name: str, got, want) -> None:
