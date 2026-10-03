@@ -1,0 +1,796 @@
+"""ncmctl 命令行封装。
+
+本模块只做两件事：把界面上的选择翻译成 **参数数组**，以及从磁盘/输出里读出状态。
+刻意不依赖 Qt，因此可以直接运行自检：
+
+    .venv/bin/python -m ncmgui.ncmctl
+
+所有命令一律以参数数组形式返回，交给 ``subprocess`` 直接 exec，不经过 shell。
+这样路径里的空格、中文、引号都无需转义，也不存在命令注入问题。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+#: 当前是不是 Windows。全模块唯一的平台判断。
+_IS_WINDOWS = sys.platform == "win32"
+
+#: 可执行文件名。Windows 上必须带 ``.exe``，否则 ``shutil.which`` 找不到。
+BINARY_NAME = "ncmctl.exe" if _IS_WINDOWS else "ncmctl"
+
+#: PATH 里找不到时，依次翻这些目录。每个目录下 ``ncmctl`` / ``ncmctl.exe``
+#: 两种写法都试一遍，这样从别的平台整包拷过来的目录也认得出来。
+_COMMON_DIRS: tuple[str, ...] = (
+    "~/go/bin",           # go install 的默认落点
+    "~/.local/bin",       # 手工放置
+    "/usr/local/bin",     # macOS（Intel）与多数 Linux 发行版
+    "/usr/bin",
+    "/opt/homebrew/bin",  # macOS（Apple Silicon）
+)
+
+if _IS_WINDOWS:  # pragma: no cover - 只在 Windows 上生效
+    _COMMON_DIRS += (
+        os.path.expandvars(r"%USERPROFILE%\go\bin"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+        os.path.expandvars(r"%USERPROFILE%\scoop\shims"),
+        r"C:\ProgramData\chocolatey\bin",
+    )
+
+
+def _fallback_paths() -> tuple[Path, ...]:
+    """把常见目录与两种可执行文件名组合成候选清单。"""
+    names = tuple(dict.fromkeys((BINARY_NAME, "ncmctl")))
+    return tuple(
+        Path(directory).expanduser() / name
+        for directory in _COMMON_DIRS
+        for name in names
+    )
+
+
+class NcmctlNotFound(RuntimeError):
+    """找不到 ncmctl 可执行文件。"""
+
+
+# --------------------------------------------------------------------------- #
+# 文本处理
+# --------------------------------------------------------------------------- #
+
+ANSI_RE = re.compile(
+    r"""
+      \x1b\[[0-9;?]*[ -/]*[@-~]          # CSI：颜色、光标移动、清屏
+    | \x1b\][^\x07\x1b]*(?:\x07|\x1b\\)  # OSC：终端标题等
+    | \x1b[@-Z\\-_]                      # 其余两字节转义
+    """,
+    re.VERBOSE,
+)
+
+
+def strip_ansi(text: str) -> str:
+    """去掉 ANSI 转义序列，让日志在 QPlainTextEdit 里保持干净。"""
+    return ANSI_RE.sub("", text)
+
+
+def describe(argv: list[str]) -> str:
+    """把参数数组渲染成可直接粘贴到终端的一行，用于日志回显。
+
+    引号规则跟着平台走，这样「复制命令」按钮拿到的字符串在目标平台上能直接跑。
+    """
+    if _IS_WINDOWS:
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
+
+
+def parse_targets(text: str) -> list[str]:
+    """把用户粘贴的歌曲 ID / URL 拆成列表。
+
+    - 以换行、空格或逗号分隔
+    - 整行以 ``#`` 开头视为注释；行内的 ``#`` 保留（URL 片段可能用到）
+    - 去重并保持原有顺序
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for token in re.split(r"[\s,]+", line):
+            token = token.strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def clamp(value: int, low: int, high: int) -> int:
+    """把并发数等数值限制在 ncmctl 接受的区间内。"""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return low
+    return max(low, min(high, value))
+
+
+# --------------------------------------------------------------------------- #
+# 可执行文件与登录状态探测
+# --------------------------------------------------------------------------- #
+
+def find_binary(explicit: str = "") -> str | None:
+    """定位 ncmctl 可执行文件，找不到返回 None。"""
+    explicit = (explicit or "").strip()
+    if explicit:
+        found = shutil.which(explicit)
+        if found:
+            return found
+        candidate = Path(explicit).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        return None
+
+    found = shutil.which(BINARY_NAME)
+    if found:
+        return found
+
+    for pattern in FALLBACK_PATHS:
+        candidate = Path(pattern).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def state_dir(home: str = "") -> Path:
+    """返回 ncmctl 的状态目录 ``<home>/.ncmctl``。"""
+    root = Path(home).expanduser() if (home or "").strip() else Path.home()
+    return root / ".ncmctl"
+
+
+def cookie_path(home: str = "") -> Path:
+    return state_dir(home) / "cookie.json"
+
+
+def is_logged_in(home: str = "") -> bool:
+    """cookie.json 存在即认为已登录（与 ncmctl 的持久化位置一致）。"""
+    try:
+        return cookie_path(home).is_file()
+    except OSError:
+        return False
+
+
+def login_timestamp(home: str = "") -> float | None:
+    """返回 cookie.json 的修改时间，用于显示「上次登录」。"""
+    try:
+        return cookie_path(home).stat().st_mtime
+    except OSError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# 全局参数
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class GlobalOpts:
+    """ncmctl 的根级持久化参数，会附加到每条命令末尾。
+
+    留空表示「不传递」，交给 ncmctl 使用自身默认值。
+    """
+
+    home: str = ""
+    config: str = ""
+    debug: bool = False
+
+    def apply(self, argv: list[str]) -> list[str]:
+        if self.home.strip():
+            argv += ["--home", self.home.strip()]
+        if self.config.strip():
+            argv += ["-c", self.config.strip()]
+        if self.debug:
+            argv.append("--debug")
+        return argv
+
+
+# --------------------------------------------------------------------------- #
+# 选项取值表（供界面下拉框使用）
+# --------------------------------------------------------------------------- #
+
+#: 下载音质：(界面显示, 传给 --level 的值)
+DOWNLOAD_LEVELS: list[tuple[str, str]] = [
+    ("标准 128 kbps", "standard"),
+    ("较高 192 kbps", "higher"),
+    ("极高 320 kbps", "exhigh"),
+    ("无损 FLAC", "lossless"),
+    ("Hi-Res 高解析", "hires"),
+]
+
+#: curl 的 API 包装器包名
+CURL_KINDS: list[tuple[str, str]] = [
+    ("weapi（网页端）", "weapi"),
+    ("eapi（客户端）", "eapi"),
+    ("linux（Linux 客户端）", "linux"),
+    ("api（原生接口）", "api"),
+]
+
+#: crypto 加密支持的格式
+ENCRYPT_KINDS: list[tuple[str, str]] = [
+    ("weapi", "weapi"),
+    ("eapi", "eapi"),
+    ("linux", "linux"),
+]
+
+#: crypto 解密支持的格式
+DECRYPT_KINDS: list[tuple[str, str]] = [
+    ("eapi", "eapi"),
+    ("xeapi", "xeapi"),
+    ("weapi", "weapi"),
+    ("linux", "linux"),
+]
+
+#: 解密输入编码
+DECRYPT_ENCODINGS: list[tuple[str, str]] = [
+    ("hex 十六进制", "hex"),
+    ("base64", "base64"),
+    ("string 原始字符串", "string"),
+]
+
+#: HAR 解密目标
+DECRYPT_TARGETS: list[tuple[str, str]] = [
+    ("自动判断", "auto"),
+    ("请求 request", "request"),
+    ("响应 response", "response"),
+    ("两者都要（仅 HAR）", "both"),
+]
+
+
+# --------------------------------------------------------------------------- #
+# 命令构建器
+# --------------------------------------------------------------------------- #
+
+def build_download(
+    targets: list[str],
+    level: str = "lossless",
+    output: str = "",
+    parallel: int = 5,
+    strict: bool = False,
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl download``：解析 ID/URL 后下载。
+
+    :param targets: 歌曲 ID、专辑/歌单/歌手 URL 列表
+    :param strict: 精确音质不可得时跳过该曲，而不是降级下载
+    """
+    if not targets:
+        raise ValueError("至少需要一个歌曲 ID 或链接")
+
+    argv = ["download"]
+    if level:
+        argv += ["--level", level]
+    if output.strip():
+        argv += ["--output", output.strip()]
+    argv += ["--parallel", str(clamp(parallel, 1, 20))]
+    if strict:
+        argv.append("--strict")
+    argv += list(targets)
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_ncm(
+    inputs: list[str],
+    output: str = "",
+    parallel: int = 10,
+    no_tag: bool = False,
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl ncm``：把 .ncm 解密成 .mp3/.flac。
+
+    :param no_tag: 传入 ``--tag``，对应 help 中的「禁用音频标签写入」
+    """
+    if not inputs:
+        raise ValueError("至少需要一个 .ncm 文件或目录")
+
+    argv = ["ncm"]
+    if output.strip():
+        argv += ["--output", output.strip()]
+    argv += ["--parallel", str(clamp(parallel, 1, 50))]
+    if no_tag:
+        argv.append("--tag")
+    argv += list(inputs)
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_cloud(
+    source: str,
+    minsize: str = "",
+    parallel: int = 3,
+    regexp: str = "",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl cloud``：上传音乐到账号云盘（单文件或目录，递归三层）。"""
+    if not source.strip():
+        raise ValueError("请选择要上传的文件或目录")
+
+    argv = ["cloud"]
+    if minsize.strip():
+        argv += ["--minsize", minsize.strip()]
+    if regexp.strip():
+        argv += ["--regexp", regexp.strip()]
+    argv += ["--parallel", str(clamp(parallel, 1, 10))]
+    argv.append(source.strip())
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_sign(automatic: bool = False, opts: GlobalOpts | None = None) -> list[str]:
+    """``ncmctl sign``：云贝 + VIP 每日签到。"""
+    argv = ["sign"]
+    if automatic:
+        argv.append("--automatic")
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_scrobble(num: int = 300, opts: GlobalOpts | None = None) -> list[str]:
+    """``ncmctl scrobble``：提交播放记录以增加听歌数。"""
+    argv = ["scrobble", "--num", str(clamp(num, 1, 300))]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_partner(
+    star: list[int] | None = None,
+    extra: list[int] | None = None,
+    num: str = "random",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl partner``：提交音乐合伙人评测。
+
+    :param star: 基础评分候选，取值 1-5
+    :param extra: 附加评分候选，取值 1-5
+    :param num: ``random`` 或 0-15 的整数
+    """
+    argv = ["partner"]
+    if star:
+        argv += ["--star", ",".join(str(s) for s in star)]
+    if extra:
+        argv += ["--extra", ",".join(str(e) for e in extra)]
+    if num:
+        argv += ["--num", str(num)]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+@dataclass
+class TaskSpec:
+    """``ncmctl task`` 的定时任务配置。"""
+
+    sign: bool = False
+    scrobble: bool = False
+    partner: bool = False
+    sign_cron: str = "0 10 * * *"
+    scrobble_cron: str = "0 18 * * *"
+    partner_cron: str = "0 18 * * *"
+    location: str = "Asia/Shanghai"
+    sign_automatic: bool = False
+    scrobble_num: int = 300
+    partner_num: str = "random"
+
+
+def build_task(spec: TaskSpec, opts: GlobalOpts | None = None) -> list[str]:
+    """``ncmctl task``：以常驻服务方式按 cron 调度任务。
+
+    未勾选任何任务时退化为 ``--runAll``，与「不带选择器即全部注册」等价。
+    """
+    argv = ["task"]
+    selectors = spec.sign or spec.scrobble or spec.partner
+
+    if not selectors:
+        argv.append("--runAll")
+    if spec.sign:
+        argv.append("--sign")
+        if spec.sign_automatic:
+            argv.append("--sign.automatic")
+        if spec.sign_cron.strip():
+            argv += ["--sign.cron", spec.sign_cron.strip()]
+    if spec.scrobble:
+        argv.append("--scrobble")
+        if spec.scrobble_cron.strip():
+            argv += ["--scrobble.cron", spec.scrobble_cron.strip()]
+        argv += ["--scrobble.num", str(clamp(spec.scrobble_num, 1, 300))]
+    if spec.partner:
+        argv.append("--partner")
+        if spec.partner_cron.strip():
+            argv += ["--partner.cron", spec.partner_cron.strip()]
+        if spec.partner_num:
+            argv += ["--partner.extNum", str(spec.partner_num)]
+
+    if spec.location.strip():
+        argv += ["--location", spec.location.strip()]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+@dataclass
+class ProxySpec:
+    """``ncmctl proxy`` 的监听与解密配置。"""
+
+    listen: str = "127.0.0.1:9000"
+    ca_cert: str = ""
+    ca_key: str = ""
+    max_body: str = "1MB"
+    show_sensitive: bool = False
+    xeapi_session_id: str = ""
+    xeapi_session_key: str = ""
+    xeapi_state_file: str = ""
+
+
+def build_proxy(spec: ProxySpec, opts: GlobalOpts | None = None) -> list[str]:
+    """``ncmctl proxy``：启动本次会话的 HTTP(S) 监控代理。"""
+    if (spec.ca_cert.strip() and not spec.ca_key.strip()) or (
+        spec.ca_key.strip() and not spec.ca_cert.strip()
+    ):
+        raise ValueError("CA 证书与私钥必须同时提供，或同时留空")
+    if (spec.xeapi_session_id.strip() and not spec.xeapi_session_key.strip()) or (
+        spec.xeapi_session_key.strip() and not spec.xeapi_session_id.strip()
+    ):
+        raise ValueError("XEAPI Session ID 与密钥必须同时提供，或同时留空")
+
+    argv = ["proxy"]
+    if spec.listen.strip():
+        argv += ["--listen", spec.listen.strip()]
+    if spec.ca_cert.strip():
+        argv += ["--ca-cert", spec.ca_cert.strip(), "--ca-key", spec.ca_key.strip()]
+    if spec.max_body.strip():
+        argv += ["--max-body", spec.max_body.strip()]
+    if spec.show_sensitive:
+        argv.append("--show-sensitive")
+    if spec.xeapi_session_id.strip():
+        argv += ["--xeapi-session-id", spec.xeapi_session_id.strip()]
+        argv += ["--xeapi-session-key", spec.xeapi_session_key.strip()]
+    if spec.xeapi_state_file.strip():
+        argv += ["--xeapi-state-file", spec.xeapi_state_file.strip()]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_crypto_encrypt(
+    payload: str,
+    kind: str = "weapi",
+    url: str = "",
+    output: str = "",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl crypto encrypt``：本地加密 NetEase API 载荷。
+
+    :param payload: JSON 文本，或一个包含 JSON 的文件路径
+    :param url: EAPI 必须提供，请求路由参与摘要计算
+    """
+    if not payload.strip():
+        raise ValueError("请填写要加密的 JSON 内容")
+
+    argv = ["crypto", "encrypt", "--kind", kind]
+    if url.strip():
+        argv += ["--url", url.strip()]
+    if output.strip():
+        argv += ["--output", output.strip()]
+    argv.append(payload)
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_crypto_decrypt(
+    ciphertext: str,
+    kind: str = "eapi",
+    encode: str = "hex",
+    dynamic_key: str = "",
+    dynamic_key_encode: str = "string",
+    target: str = "auto",
+    url: str = "*",
+    output: str = "",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl crypto decrypt``：解密 EAPI/XEAPI 载荷或 HAR 抓包。"""
+    if not ciphertext.strip():
+        raise ValueError("请填写要解密的密文或 HAR 文件路径")
+
+    argv = ["crypto", "decrypt", "--kind", kind, "--encode", encode]
+    if dynamic_key.strip():
+        argv += ["--dynamic-key", dynamic_key.strip()]
+        argv += ["--dynamic-key-encode", dynamic_key_encode]
+    if target:
+        argv += ["--target", target]
+    if url.strip():
+        argv += ["--url", url.strip()]
+    if output.strip():
+        argv += ["--output", output.strip()]
+    argv.append(ciphertext)
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_curl(
+    method: str,
+    kind: str = "weapi",
+    data: str = "{}",
+    output: str = "",
+    timeout: str = "15s",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl curl``：调用导出的 Go API 方法。
+
+    注意这里的 method 是 Go 方法名（如 ``GetUserInfo``），不是 HTTP 动词。
+    """
+    if not method.strip():
+        raise ValueError("请填写要调用的 API 方法名")
+
+    argv = ["curl", "--kind", kind, "--data", data or "{}"]
+    if timeout.strip():
+        argv += ["--timeout", timeout.strip()]
+    if output.strip():
+        argv += ["--output", output.strip()]
+    argv.append(method.strip())
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_login_qrcode(
+    directory: str,
+    level: int = 1,
+    timeout: str = "5m",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl login qrcode``：生成 ``qrcode.png`` 并等待手机端确认。
+
+    界面会轮询 ``directory/qrcode.png`` 把它显示出来。
+    """
+    if not directory.strip():
+        raise ValueError("二维码输出目录不能为空")
+
+    argv = ["login", "qrcode", "--dir", directory.strip(), "--level", str(clamp(level, 0, 3))]
+    if timeout.strip():
+        argv += ["--timeout", timeout.strip()]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_login_phone(
+    number: str,
+    countrycode: int = 86,
+    password: str = "",
+    timeout: str = "10m",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl login phone``：短信验证码或密码登录。
+
+    :param password: 留空则走短信验证码流程（需要在控制台里输入验证码）
+    """
+    if not number.strip():
+        raise ValueError("请填写手机号")
+
+    argv = ["login", "phone", "--countrycode", str(int(countrycode))]
+    if password:
+        argv += ["--password", password]
+    if timeout.strip():
+        argv += ["--timeout", timeout.strip()]
+    argv.append(number.strip())
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_login_cookie(
+    file: str = "",
+    content: str = "",
+    fmt: str = "",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl login cookie``：从浏览器导出的 Cookie 登录。
+
+    界面通常先把粘贴的 Cookie 写入 0600 权限的临时文件再传 ``--file``，
+    避免凭据出现在进程参数里。
+    """
+    if not file.strip() and not content.strip():
+        raise ValueError("请选择 Cookie 文件，或粘贴 Cookie 内容")
+
+    argv = ["login", "cookie"]
+    if fmt.strip():
+        argv += ["--format", fmt.strip()]
+    if file.strip():
+        argv += ["--file", file.strip()]
+    else:
+        argv.append(content.strip())
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_login_cookiecloud(
+    uuid: str,
+    password: str,
+    server: str = "",
+    timeout: str = "",
+    headers: str = "",
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl login cookiecloud``：从 CookieCloud 服务器同步 Cookie 登录。"""
+    if not uuid.strip() or not password:
+        raise ValueError("CookieCloud 的 UUID 与密码都是必填项")
+
+    argv = ["login", "cookiecloud", "--uuid", uuid.strip(), "--password", password]
+    if server.strip():
+        argv += ["--server", server.strip()]
+    if timeout.strip():
+        argv += ["--timeout", timeout.strip()]
+    if headers.strip():
+        argv += ["--headers", headers.strip()]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_logout(
+    clear_anonymous_token: bool = False,
+    opts: GlobalOpts | None = None,
+) -> list[str]:
+    """``ncmctl logout``：登出并删除本地会话状态。"""
+    argv = ["logout"]
+    if clear_anonymous_token:
+        argv.append("--clear-anonymous-token")
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_update(proxy: str = "", opts: GlobalOpts | None = None) -> list[str]:
+    """``ncmctl update``：从 GitHub Release 更新自身。
+
+    :param proxy: 空格分隔的代理前缀；传空字符串表示强制直连
+    """
+    argv = ["update"]
+    if proxy.strip():
+        argv += ["--proxy", proxy.strip()]
+    return (opts or GlobalOpts()).apply(argv)
+
+
+def build_version(opts: GlobalOpts | None = None) -> list[str]:
+    """``ncmctl --version``：探测版本。"""
+    return (opts or GlobalOpts()).apply(["--version"])
+
+
+# --------------------------------------------------------------------------- #
+# 自检
+# --------------------------------------------------------------------------- #
+
+def _selftest() -> int:
+    """对每个构建器断言参数数组，返回失败数量。"""
+    g = GlobalOpts()
+    failures: list[str] = []
+
+    def check(name: str, got: list[str], want: list[str]) -> None:
+        if got != want:
+            failures.append(f"{name}\n    期望 {want}\n    实际 {got}")
+
+    check(
+        "download 常规",
+        build_download(["2161154646", "1820944399"], "lossless", "/tmp/m", 4, False),
+        ["download", "--level", "lossless", "--output", "/tmp/m", "--parallel", "4",
+         "2161154646", "1820944399"],
+    )
+    check(
+        "download 严格 + 并发越界钳制",
+        build_download(["1"], "hires", "", 99, True),
+        ["download", "--level", "hires", "--parallel", "20", "--strict", "1"],
+    )
+    check(
+        "ncm 默认写标签",
+        build_ncm(["/m/a.ncm"], "/tmp/n", 10, False),
+        ["ncm", "--output", "/tmp/n", "--parallel", "10", "/m/a.ncm"],
+    )
+    check(
+        "ncm 禁用标签",
+        build_ncm(["/m/a.ncm"], "", 10, True),
+        ["ncm", "--parallel", "10", "--tag", "/m/a.ncm"],
+    )
+    check(
+        "cloud 全参数",
+        build_cloud("/m", "1MB", 5, r".*\.flac$"),
+        ["cloud", "--minsize", "1MB", "--regexp", r".*\.flac$", "--parallel", "5", "/m"],
+    )
+    check("sign", build_sign(True), ["sign", "--automatic"])
+    check("scrobble 越界钳制", build_scrobble(999), ["scrobble", "--num", "300"])
+    check(
+        "partner",
+        build_partner([3, 4], [2, 3, 4], "5"),
+        ["partner", "--star", "3,4", "--extra", "2,3,4", "--num", "5"],
+    )
+    check(
+        "task 全部默认",
+        build_task(TaskSpec()),
+        ["task", "--runAll", "--location", "Asia/Shanghai"],
+    )
+    check(
+        "task 仅签到",
+        build_task(TaskSpec(sign=True, sign_cron="0 10 * * *")),
+        ["task", "--sign", "--sign.cron", "0 10 * * *", "--location", "Asia/Shanghai"],
+    )
+    check(
+        "proxy 默认",
+        build_proxy(ProxySpec()),
+        ["proxy", "--listen", "127.0.0.1:9000", "--max-body", "1MB"],
+    )
+    check(
+        "proxy CA 配对",
+        build_proxy(ProxySpec(ca_cert="/c.crt", ca_key="/c.key")),
+        ["proxy", "--listen", "127.0.0.1:9000",
+         "--ca-cert", "/c.crt", "--ca-key", "/c.key", "--max-body", "1MB"],
+    )
+    check(
+        "crypto encrypt",
+        build_crypto_encrypt('{"key":"value"}', "weapi", "", ""),
+        ["crypto", "encrypt", "--kind", "weapi", '{"key":"value"}'],
+    )
+    check(
+        "crypto decrypt xeapi",
+        build_crypto_decrypt("DEADBEEF", "xeapi", "hex", "", "string", "auto", "*", ""),
+        ["crypto", "decrypt", "--kind", "xeapi", "--encode", "hex",
+         "--target", "auto", "--url", "*", "DEADBEEF"],
+    )
+    check(
+        "curl",
+        build_curl("GetUserInfo", "weapi", "{}", "", "15s"),
+        ["curl", "--kind", "weapi", "--data", "{}", "--timeout", "15s", "GetUserInfo"],
+    )
+    check(
+        "login qrcode",
+        build_login_qrcode("/tmp/qr", 1, "5m"),
+        ["login", "qrcode", "--dir", "/tmp/qr", "--level", "1", "--timeout", "5m"],
+    )
+    check(
+        "login phone 短信",
+        build_login_phone("18800008888"),
+        ["login", "phone", "--countrycode", "86", "--timeout", "10m", "18800008888"],
+    )
+    check(
+        "login cookie 文件优先",
+        build_login_cookie(file="/tmp/c.txt", content="MUSIC_U=x", fmt="header"),
+        ["login", "cookie", "--format", "header", "--file", "/tmp/c.txt"],
+    )
+    check(
+        "login cookiecloud",
+        build_login_cookiecloud("u", "p", "", "", ""),
+        ["login", "cookiecloud", "--uuid", "u", "--password", "p"],
+    )
+    check("logout", build_logout(True), ["logout", "--clear-anonymous-token"])
+    check("update", build_update(""), ["update"])
+
+    # 全局参数附加
+    check(
+        "全局参数附加",
+        build_sign(False, GlobalOpts(home="/srv/h", config="/c.yaml", debug=True)),
+        ["sign", "--home", "/srv/h", "-c", "/c.yaml", "--debug"],
+    )
+
+    # 目标解析
+    parsed = parse_targets("2161154646\n# 注释\n2161154646  https://music.163.com/song?id=1,\n")
+    if parsed != ["2161154646", "https://music.163.com/song?id=1"]:
+        failures.append(f"parse_targets 期望去重并跳过注释，实际 {parsed}")
+
+    # ANSI 清洗
+    if strip_ansi("\x1b[31m红色\x1b[0m 正常") != "红色 正常":
+        failures.append("strip_ansi 未能清除 CSI 序列")
+
+    # 参数校验
+    for name, fn in (
+        ("download 空目标", lambda: build_download([])),
+        ("proxy CA 不配对", lambda: build_proxy(ProxySpec(ca_cert="/a.crt"))),
+        ("login phone 空号", lambda: build_login_phone("")),
+    ):
+        try:
+            fn()
+        except ValueError:
+            pass
+        else:
+            failures.append(f"{name} 应当抛出 ValueError")
+
+    if failures:
+        print(f"自检失败 {len(failures)} 项：")
+        for item in failures:
+            print(f"  - {item}")
+        return 1
+
+    print("ncmctl 命令构建自检全部通过")
+    print(f"探测到的可执行文件：{find_binary() or '未找到'}")
+    print(f"登录状态：{'已登录' if is_logged_in() else '未登录'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_selftest())

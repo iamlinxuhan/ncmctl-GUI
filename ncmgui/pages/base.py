@@ -1,0 +1,105 @@
+"""页面基类。
+
+统一三件事：
+
+* 内容区可滚动（参数表单通常比窗口高）
+* 页面标题样式一致
+* 提交作业、读取配置、登录校验这些跨页面动作都有统一的入口
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Callable
+
+from PyQt6.QtWidgets import QFrame, QMessageBox, QScrollArea, QVBoxLayout, QWidget
+
+from .. import ncmctl
+from ..widgets.card import page_header
+
+if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注，避免循环导入
+    from ..window import MainWindow
+
+
+class BasePage(QWidget):
+    """所有功能页的父类。"""
+
+    PAGE_TITLE = ""
+    PAGE_SUBTITLE = ""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__()
+        self.window = window
+        self.cfg = window.cfg
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        inner = QWidget()
+        self.content = QVBoxLayout(inner)
+        self.content.setContentsMargins(26, 22, 26, 26)
+        self.content.setSpacing(16)
+        scroll.setWidget(inner)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(scroll)
+
+        if self.PAGE_TITLE:
+            self.content.addWidget(page_header(self.PAGE_TITLE, self.PAGE_SUBTITLE))
+
+        self.build()
+        self.content.addStretch(1)
+
+    # ------------------------------------------------------------ 子类钩子
+
+    def build(self) -> None:
+        """构建页面内容。子类必须实现。"""
+
+    def save_config(self) -> None:
+        """窗口关闭前把界面上的设置写回配置。子类按需覆盖。"""
+
+    def on_login_changed(self, logged_in: bool) -> None:
+        """登录状态变化时的回调。子类按需覆盖。"""
+
+    # ------------------------------------------------------------ 便捷方法
+
+    def opts(self) -> ncmctl.GlobalOpts:
+        """当前生效的全局参数（--home / -c / --debug）。"""
+        return self.window.global_opts()
+
+    def submit(
+        self,
+        title: str,
+        argv: list[str],
+        confirm: tuple[str, str] | None = None,
+        intro: list[str] | None = None,
+        tagger: Callable[[str], str | None] | None = None,
+    ):
+        """提交一个作业，返回 JobRunner 或 None。
+
+        :param intro: 见 :meth:`MainWindow.submit` —— 进程开跑前先写进控制台的行
+        :param tagger: 见 :meth:`MainWindow.submit` —— 给运行中的输出行加标记
+        """
+        return self.window.submit(title, argv, confirm, intro=intro, tagger=tagger)
+
+    def is_logged_in(self) -> bool:
+        return self.window.is_logged_in()
+
+    def require_login(self, action: str = "该操作") -> bool:
+        """需要登录的动作在未登录时给出明确引导。"""
+        if self.window.is_logged_in():
+            return True
+        QMessageBox.warning(
+            self,
+            "需要登录",
+            f"{action}需要登录网易云账号。<br><br>"
+            "请先到左侧「账号」页完成登录（推荐扫码，最简单）。",
+        )
+        return False
+
+    def warn(self, message: str, title: str = "无法执行") -> None:
+        QMessageBox.warning(self, title, message)
+
+    def toast(self, message: str) -> None:
+        self.window.toast(message)

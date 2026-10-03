@@ -1,0 +1,83 @@
+name: 构建
+
+# 推 main 时三平台各打一次包，用来尽早暴露某个平台特有的构建问题；
+# 打 tag（形如 v1.0.0）时额外把产物发成 Release；
+# 也可以在 Actions 页面手动触发。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了不要连累另外两个，先把能出的产物出出来
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+          - target: windows-x86_64
+            os: windows-latest
+          - target: macos-arm64
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 三平台都有现成的 PyQt6 与 pywinpty wheel，不用现场编译
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      # 这两个自检是纯函数，不联网、不需要 ncmctl 在场，正好用来卡住
+      # 「命令构建层被改坏了」这类问题
+      - name: 离线自检
+        run: |
+          python -m ncmgui.ncmctl
+          python -m ncmgui.resolver
+
+      - name: 打包
+        env:
+          NCMGUI_BUILD_NAME: ncmctl-gui-${{ matrix.target }}
+        run: pyinstaller ncmctl-gui.spec --noconfirm
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncmctl-gui-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          # 产物名已经带了平台后缀，合并到一处不会互相覆盖
+          path: dist
+          merge-multiple: true
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

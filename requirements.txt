@@ -1,0 +1,28 @@
+# ncmctl GUI 的依赖
+#
+# 安装：
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install -r requirements.txt
+#
+# 或者用更快的 uv：
+#   uv venv && uv pip install -r requirements.txt
+
+# 界面框架。唯一必须的依赖，三个平台通用。
+PyQt6>=6.5
+
+# Windows 专用：伪终端（ConPTY）。
+#
+# 为什么非它不可：ncmctl download 一进来就调 pb.StartPool()，那个函数会去问
+# 「我的标准输出是不是一块真终端」—— Windows 上走 GetConsoleMode，stdout 是
+# 管道就直接失败退出，一个字节都下不了。而 Python 标准库在 Windows 上没有 pty，
+# 想给子进程一块 ConPTY 就只能靠这个库。
+#
+# Linux / macOS 用标准库的 pty 模块，装了也没用，所以按平台条件安装。
+# 打包时会连同它自带的 conpty.dll / OpenConsole.exe 一起进 exe，用户无感。
+pywinpty>=2.0; sys_platform == "win32"
+
+# 可选：二维码登录的兜底渲染。
+# ncmctl 会自己生成 qrcode.png，本程序优先直接显示它；
+# 只有在 PNG 没生成时，才用这个库把终端里打印的二维码内容渲染出来。
+# 缺失时程序照常运行，只是在那种情况下给出文字提示。
+qrcode[pil]>=7.4
