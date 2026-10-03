@@ -53,6 +53,24 @@ jobs:
           NCMGUI_BUILD_NAME: ncmctl-gui-${{ matrix.target }}
         run: pyinstaller ncmctl-gui.spec --noconfirm
 
+      # 这一条是专门给 Windows 兜底的。pywinpty 除了 Python 扩展之外还带几个
+      # 非 .pyd 的二进制，PyInstaller 的常规依赖分析看不到它们，全靠 spec 里那句
+      # collect_all("winpty")。而 collect_all 找不到包时只警告不报错 —— 少了
+      # conpty.dll，打包照样「成功」，用户那边却一开下载就报错。这个平台本地
+      # 又测不了，所以让 CI 把产物拆开点名清点。
+      - name: 清点 Windows 产物里的 ConPTY 运行时
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist/*.exe | Select-Object -First 1
+          pyi-archive_viewer -l $exe.FullName > toc.txt
+          foreach ($name in 'conpty.dll', 'OpenConsole.exe', 'winpty.dll', 'winpty-agent.exe') {
+            if (-not (Select-String -Path toc.txt -SimpleMatch -Pattern $name -Quiet)) {
+              throw "产物里没有 $name —— pywinpty 的运行时二进制没被打进去"
+            }
+          }
+          Write-Host "ConPTY 运行时齐全：$($exe.Name)"
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
