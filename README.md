@@ -226,6 +226,9 @@ pyinstaller ncmctl-gui.spec --noconfirm
 
 CI（`.github/workflows/build.yaml`）在推 `main` 时会三平台各打一次包（只出产物、
 不发 Release），用来尽早暴露某个平台特有的构建问题；打 `v*` tag 时才额外发 Release。
+Windows 上还会把产物拆开点一遍，确认 pywinpty 的 `conpty.dll` 等运行时文件确实
+打进去了 —— 这类文件不是 `.pyd`，PyInstaller 的依赖分析看不到，漏了也不会报错，
+只会在用户那边变成「一下载就失败」。
 
 ### 代码结构
 
